@@ -1,0 +1,311 @@
+#!/usr/bin/env groovy
+
+def call() {
+
+    properties([[$class: 'BuildDiscarderProperty', strategy: [$class: 'LogRotator', numToKeepStr: '5']]])
+
+    node {
+        checkout scm
+        appVersion = pomXml('version')
+        appName = pomXml('name')
+        appKey = pomXml('artifactId')
+        currentBuild.displayName = "${appName}-${appVersion}-${env.BUILD_NUMBER}"
+    }
+
+    pipeline {
+        agent { label 'master' }
+        tools { 
+            maven 'Maven 3.6.3' 
+            jdk 'Java 11' 
+        }
+
+        stages {
+            stage('Build') {
+                
+                when {
+                    beforeInput true
+                    beforeAgent true
+                    anyOf {
+                        branch '*-merge'
+                        branch 'master'
+                    }
+                }
+                
+                steps {
+                    mvnCommand 'clean package -DskipTests'
+                }
+            }
+            stage('Unit Test') {
+                when {
+                    beforeInput true
+                    beforeAgent true
+                    anyOf {
+                        branch '*-merge'
+                        branch 'master'
+                    }
+                }
+                steps {
+                    mvnCommand 'jacoco:prepare-agent@prepare-ut-agent surefire:test -Pdev'
+                }
+                post {
+                    always {
+                        junit allowEmptyResults: true, testResults:'target/surefire-reports/*.xml'
+                    }
+                }
+            }
+            stage('Integration Test') {
+                when {
+                    beforeInput true
+                    beforeAgent true
+                    anyOf {
+                        branch '*-merge'
+                        branch 'master'
+                    }
+                }
+                steps {
+                    mvnCommand 'jacoco:prepare-agent-integration@prepare-it-agent failsafe:integration-test -P dev -DskipTests=false'
+                }
+                post {
+                    always {
+                        junit allowEmptyResults: true, testResults:'target/failsafe-reports/*.xml'
+                    }
+                }
+            }
+        
+            stage('SonarQube') {
+                environment {
+                    appVersion = pomXml('version')
+                    appName = pomXml('name')
+                }
+                
+                when {
+                    branch 'master'
+                }
+                
+                steps {
+                    mvnCommand 'verify -DskipTests' +
+                            ' sonar:sonar' +
+                            ' -Dsonar.java.binaries=target' +
+                            " -Dsonar.projectName='${appName}'" +
+                            " -Dsonar.projectVersion=${appVersion}" +
+                            ' -Dsonar.host.url=http://10.154.7.4:9000/sonar/' +
+                            ' -Dsonar.login=1d9313b0e4142118aa84858b1733caf248a665d4' +
+                            ' -Dsonar.sourceEncoding=UTF-8' +
+                            " -Dsonar.branch.name=${env.GIT_BRANCH}"
+                }
+            }
+            
+            stage('SonarQube Diff') {
+                environment {
+                    appVersion = pomXml('version')
+                    appName = pomXml('name')
+                    gitlabProjectId = pomXml('gitlabProjectId')
+                }
+                
+                when {
+                    branch '*-merge'
+                }
+                
+                steps {
+                    script{
+                        sh "git reset --hard HEAD^"
+                        def commits = sh(script: "git log --pretty=format:%H origin/master..", returnStdout: true).replaceAll('\n', ',')
+    
+                        sh ' mvn verify -DskipTests' +
+                                ' sonar:sonar -X' +
+                                ' -Dsonar.java.binaries=target' +
+                                " -Dsonar.projectName='${appName}'" +
+                                " -Dsonar.projectVersion=${appVersion}" +
+                                " -Dsonar.branch.name=${env.GIT_BRANCH}" +
+                                ' -Dsonar.exclusions=**/syntaxes_flux/**' +
+                                " -Dsonar.coverage.jacoco.xmlReportPaths=target/jacoco-reports/jacoco.xml" +
+                                ' -Dsonar.host.url=http://10.154.7.4:9000/sonar/' +
+                                ' -Dsonar.login=1d9313b0e4142118aa84858b1733caf248a665d4' +
+                                ' -Dsonar.sourceEncoding=UTF-8' +
+                                " -Dsonar.gitlab.commit_sha=${commits}" +
+                                " -Dsonar.gitlab.ref_name=${env.GIT_BRANCH}" +
+                                " -Dsonar.gitlab.project_id='${gitlabProjectId}'" +
+                                " -Dsonar.branch.target=master" +
+                                " -Dsonar.gitlab.unique_issue_per_inline=true" +
+                                " -Dsonar.gitlab.only_issue_from_commit_file=true" +
+                                " -Dsonar.gitlab.all_issues=true" +
+                                " -Dsonar.gitlab.max_global_issues=50" +
+                                " -Dsonar.gitlab.quality_gate_fail_mode=NONE"
+                    }
+                    
+                }
+            }
+            
+            stage('Artifactory snapshot') {
+                when {
+                    beforeInput true
+                    beforeAgent true
+                    branch 'master'
+                }
+                steps {
+                    mvnCommand 'deploy -DskipTests' +
+                            ' -DaltDeploymentRepository=artifactory::default::http://10.154.7.4:8081/artifactory/snapshots'
+                }
+            }
+
+            stage('Ansible Deployment') {
+                steps {
+		            //Will be needed on prem AIFE
+                    //sh '''sudo su -c "ssh -tt ifelinfe4848 \\"whoami >> /tmp/create_file_ansible\\"" ansible'''
+	                ansibleSpringBoot('develop', 'snapshots')
+                }
+            }
+            
+            stage('Release') {
+                stages {
+                    stage('Release version') {
+                        when {
+                            beforeInput true
+                            beforeAgent true
+                            branch '*stable'
+                        }
+                        options {
+                            timeout(time: 1, unit: 'HOURS')
+                        }
+                        input {
+                            message "Should we release this version?"
+                            ok "Yes, we should."
+                            parameters {
+                                string(name: 'APP_VERSION', defaultValue: '1.0.0', description: 'Target version')
+                            }
+                        }
+                        steps {
+                            sh 'git config --global user.email "sa-jenkins-ci@soprasteria.com"'
+                            sh 'git config --global user.name "SA jenkins"'
+                            sh 'git config http.sslVerify false'
+                            sh 'git config --global credential.helper store'
+                            withCredentials([usernamePassword(credentialsId: 'Jenkins-ci-on-gitlab-aife', passwordVariable: 'pass', usernameVariable: 'user')]) {
+                                sh "echo https://${user}:${pass}@ifelinfe4849.aife.local > ~/.git-credentials"
+                            }
+        
+                            sh 'whoami'
+                            sh 'rm -rf m2-settings.xml'
+                            sh "git checkout ${env.GIT_BRANCH}"
+                            mvnCommand "versions:set -DnewVersion=${APP_VERSION} -DgenerateBackupPoms=false"
+                            mvnCommand 'test'
+                            mvnCommand 'sonar:sonar' +
+                                    ' -Dsonar.host.url=http://10.154.7.4:9000/sonar/' +
+                                    ' -Dsonar.login=1d9313b0e4142118aa84858b1733caf248a665d4' +
+                                    ' -Dsonar.sourceEncoding=UTF-8' +
+                                    " -Dsonar.branch.name=${env.GIT_BRANCH}"
+                            sh 'git commit -am "Update pom.xml version [ci skip]"'
+                            sh "git push origin ${env.GIT_BRANCH}"
+                            sh "git tag v${APP_VERSION}"
+                            sh 'git push origin --tags'
+                            mvnCommand 'deploy -DskipTests ' +
+                                    ' -DaltDeploymentRepository=artifactory::default::http://10.154.7.4:8081/artifactory/releases'
+                        }
+                    }
+                    stage('Ansible Deployment') {
+                        when {
+                            beforeInput true
+                            beforeAgent true
+                            branch '*stable'
+                        }
+                        steps {
+                            sh 'sudo su - ansible'
+                            ansibleSpringBoot('recette', 'releases')
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private Object pomXml(String item) {
+    def matcher = readFile('pom.xml') =~ "<${item}>(.+)</${item}>"
+    return matcher ? matcher[0][1] : null
+}
+
+
+private void mvnCommand(String commandLine) {
+    writeFile file: "m2-settings.xml", text: '''<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
+                    https://maven.apache.org/xsd/settings-1.0.0.xsd">
+<proxies>
+  <proxy>
+      <id>proxy</id>
+      <active>true</active>
+      <protocol>http</protocol>
+      <host>10.154.227.90</host>
+      <port>3128</port>
+      <nonProxyHosts>127.0.0.1|localhost|10.154.7.4|*.aife.local</nonProxyHosts>
+    </proxy>
+  </proxies>
+  <servers>
+    <server>
+      <id>artifactory</id>
+      <username>admin</username>
+      <password>AIFEEJ2020</password>
+    </server>
+    <server>
+      <id>ej-libs-external</id>
+      <username>admin</username>
+      <password>AIFEEJ2020</password>
+    </server>
+    <server>
+      <id>ej-release-local</id>
+      <username>admin</username>
+      <password>AIFEEJ2020</password>
+    </server>
+  </servers>
+</settings>
+'''
+    sh 'mvn -s m2-settings.xml -B ' + commandLine
+}
+
+private void ansibleSpringBoot(host, repo) {
+    String appName = pomXml('name')
+    String appArtifactId = pomXml('artifactId')
+    String appVersion = pomXml('version')
+    String appExtension = pomXml('packaging')
+    String versionToDownload = getLatestArtifact(appArtifactId, appVersion, 'jar', repo)
+    
+    sh "echo app name $appName"
+    sh "echo app artifact id $appArtifactId"
+    sh "echo app version $appVersion"
+    sh "echo app extension $appExtension"
+    sh "echo app versionToDownload $versionToDownload"
+    sh "echo app host $host"
+    sh "echo app repo $repo"
+
+    // Checkout role ansible-springboot
+    dir('ansible') {
+        sh 'git config --global http.sslVerify false'
+        git branch: 'master', credentialsId: 'Jenkins-ci-on-gitlab-aife', url: 'https://ifelinfe4849.aife.local/aife/infra/ansible.git'
+
+ 	withEnv(["ANSIBLE_CONFIG=ansible.cfg", "FILE_NAME=${versionToDownload}", "HOST=${host}", "REPO=${repo}"]) {
+        ansiColor('xterm') {
+            ansiblePlaybook(
+                credentialsId: 'ansible_id_rsa',
+		        inventory: 'inventories/$host',
+                playbook: 'deploy_springboot.yml',
+                extraVars: [
+                    repository_path: "$repo/fr/finances/gouv/$appArtifactId/$appVersion/{{package_name}}",
+                    package_name : "${FILE_NAME}",
+                    service_name : "$appArtifactId"
+                ],
+                colorized: true,
+                extras: '-vv'
+                )
+           }
+        }
+    }
+}
+
+private String getLatestArtifact(appArtifactId, appVersion, appType, repo) {
+    return sh(
+            script: """curl -u admin:AIFEEJ2020 'http://10.154.7.4:8081/artifactory/${repo}/fr/finances/gouv/${appArtifactId}/${appVersion}/' | grep -o '${appArtifactId}-[^"]*.${appType}' | sort | tail -1""",
+            returnStdout: true,
+    ).replaceAll("\n","")
+}
+
+

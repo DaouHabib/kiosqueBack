@@ -1,0 +1,29 @@
+sudo kill -9 'sudo lsof -t -i:22222'
+
+helmet for security
+
+Config — Uued to retrieve jwtPrivateKey
+joi — validation function
+express — web framework
+mongoose — create models and schema
+jsonwebtoken — generate and verify JWT
+bcrypt — hashing the password to store in the database
+morgan
+
+docker
+show dbs
+use
+show collections
+erreur coding
+pagination BEv------
+
+
+lsof -wni tcp:3000 
+kill -9 iPID
+FIlter by date
+AuthSECURE API
+Change harcode userId
+pagination BE
+
+
+sudo kill -9 $(sudo lsof -t -i:3000)

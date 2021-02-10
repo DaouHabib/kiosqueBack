@@ -1,0 +1,203 @@
+#!/usr/bin/env groovy
+
+def call() {
+
+    properties([[$class: 'BuildDiscarderProperty', strategy: [$class: 'LogRotator', numToKeepStr: '5']]])
+
+    pipeline {
+        agent { label 'master'}
+        environment {
+            http_proxy = "http://10.154.227.90:3128"
+            https_proxy = "http://10.154.227.90:3128"
+            no_proxy = "127.0.0.1,localhost,10.0.0.0/24,.aife.local"
+            APP_NAME = readPackageJson('.name')
+            APP_GROUP = readPackageJson('.group')
+            APP_VERSION = readPackageJson('.version')
+            APP_DEP = readPackageJson('.appDependencies')
+            APP_PORT = readDeployProperties('port', 'dev')
+        }
+        tools {
+            nodejs 'Node 12.14.1'
+        }
+        stages {
+            stage('Build') {
+                when {
+                    beforeInput true
+                    beforeAgent true
+                    anyOf {
+                        branch '*-merge'
+                        branch 'master'
+                    }
+                }
+                steps {
+                    sh 'rm -rf dist'
+                    sh 'rm -f ./package-lock.json'
+                    sh 'npm install'
+
+                    script{
+                        if(env.APP_DEP != null && env.APP_DEP != "" && env.APP_DEP != "null"){
+                            for(String dep in env.APP_DEP.split(",")){
+                                sh "npm link $dep"
+                            }
+                        }
+                    }
+
+                    sh './node_modules/@angular/cli/bin/ng build'
+                    sh 'rm -rf dist/*.tar.gz'
+                    dir("dist") {
+                        sh "tar -zcvf ${env.APP_NAME}-${env.APP_VERSION}-SNAPSHOT.tar.gz *"
+                    }
+                }
+            }
+            stage('Link'){
+                when {
+                    beforeInput true
+                    beforeAgent true
+                    branch 'master'
+                }
+                steps {
+                    dir("dist/${env.APP_NAME}") {
+                        sh 'npm link'
+                    }
+                }
+            }
+            /*stage('test') {
+                when {
+                    beforeInput true
+                    beforeAgent true
+                    anyOf {
+                        branch '*-merge'
+                        branch 'master'
+                    }
+                }
+                steps {
+                    sh 'npm run jenkins'
+                }
+            }*/
+
+            stage('Nettoyage Node Modules') {
+                when {
+                    beforeInput true
+                    beforeAgent true
+                    anyOf {
+                        branch '*-merge'
+                    }
+                }
+                steps {
+                    sh 'rm -rf dist'
+                    sh 'rm -rf node_modules'
+                }
+            }
+            
+            stage('Sonarqube') {
+                when {
+                        branch 'master'
+                }
+                environment {
+                    scannerHome = tool 'SonarQubeScanner'
+                }
+                steps {
+                    withSonarQubeEnv('Sonar') {
+                        sh "${scannerHome}/bin/sonar-scanner -X " +
+                                        "-Dsonar.analysis.mode=publish"
+                    
+                    /*timeout(time: 10, unit: 'MINUTES') {
+                        waitForQualityGate abortPipeline: true
+                    }*/
+                    }
+                }
+            }
+            stage('SonarQube diff') {
+                    when {
+                        beforeInput true
+                        beforeAgent true
+                        branch '*-merge'
+                    }
+                    environment {
+                        scannerHome = tool 'SonarQubeScanner'
+                    }
+                    steps {
+                        withSonarQubeEnv('Sonar') {
+                            script{
+                                sh "git reset --hard HEAD^"
+                                def commits = sh(script: "git log --pretty=format:%H origin/master..", returnStdout: true).replaceAll('\n', ',')
+                                
+                                sh "${scannerHome}/bin/sonar-scanner -X -Dsonar.sources=sonar-project.properties -Dsonar.gitlab.commit_sha=${commits} -Dsonar.gitlab.ref_name=${env.GIT_BRANCH} -Dsonar.branch.name=${env.GIT_BRANCH} -Dsonar.branch.target=master"
+                            }
+                        }
+                        /*timeout(time: 10, unit: 'MINUTES') {
+                            waitForQualityGate abortPipeline: true
+                        }*/
+                   }
+                }
+
+
+        }
+    }
+}
+
+private String readPackageJson(String jsonQuery) {
+    return sh(
+            script: "cat package.json | jq -r \"${jsonQuery}\"",
+            returnStdout: true,
+    ).replaceAll("\n","")
+}
+
+private String readDeployProperties(String properties, String envName) {
+    return sh(
+            script: "cat deploy.properties | grep ${properties}-${envName} | cut -d':' -f2",
+            returnStdout: true,
+    ).replaceAll("\n","")
+}
+
+
+private void ansibleAngular(String envName, String targetVm) {
+    // Write ansible.cfg
+    writeFile file: "ansible-playbooks/ansible.cfg", text: '''[defaults]
+remote_tmp     = /tmp/remote
+local_tmp      = /tmp/local
+stdout_callback = debug
+host_key_checking = False'''
+
+    // Checkout role ansible-springboot
+    dir('ansible-playbooks/ansible-angular') {
+        sh 'git config --global http.sslVerify false'
+        git branch: 'master', credentialsId: 'Jenkins-ci-on-gitlab-aife', url: 'https://ifelinfe4849.aife.local/aife/cicd/ansible-roles/ansible-angular.git'
+    }
+
+    // Write ansible playbook using ansible-springboot role
+    writeFile file: "ansible-playbooks/angular.yml", text: """---
+- name: Deploy
+  hosts: all
+  become: yes
+  roles:
+    - role: ansible-angular
+      app_name: ${env.APP_NAME}
+      vhost_server_name: ${env.APP_NAME}-$envName
+      vhost_server_port: ${env.APP_PORT}
+      angular_src_file: ${env.APP_NAME}.tar.gz"""
+      
+    // Write host file
+    writeFile file: "ansible-playbooks/hosts.ini", text: """[all:vars]
+ansible_user=ansible
+
+[all]
+${targetVm}"""
+
+    // Copy jar and application.yml files
+    sh "mkdir -p ansible-playbooks/files ansible-playbooks/templates"
+    sh "cp dist/${env.APP_NAME}-*.tar.gz ansible-playbooks/files/${env.APP_NAME}.tar.gz"
+
+    withEnv(["ANSIBLE_CONFIG=ansible-playbooks/ansible.cfg"]) {
+        ansiColor('xterm') {
+            ansiblePlaybook(
+                    credentialsId: 'ansible_id_rsa',
+                    inventory: 'ansible-playbooks/hosts.ini',
+                    playbook: 'ansible-playbooks/angular.yml',
+                    colorized: true,
+                    extras: '-vv'
+            )
+        }
+    }
+}
+
